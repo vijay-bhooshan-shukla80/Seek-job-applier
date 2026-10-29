@@ -55,6 +55,17 @@ from config import CONFIG
 
 
 class ConfigDrivenFilterTests(unittest.TestCase):
+    def setUp(self):
+        # Legacy scenarios use explicit fixtures; importing config must never
+        # silently change the real user's preferences under a test runner.
+        for patcher in [
+            mock.patch.dict("SeekBot.JOB_FILTERS_CFG", {"location": [], "experience": ["3 years"], "expected_salary": [80000], "strict_job_type": False}),
+            mock.patch.dict("SeekBot.MATCHING_CFG", {"exact_position_match": False}),
+            mock.patch("SeekBot.ALLOW_RELATED_ROLES", True),
+        ]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     class _FakeElement:
         def __init__(self, text="", displayed=True, on_click=None):
             self.text = text
@@ -168,6 +179,7 @@ class ConfigDrivenFilterTests(unittest.TestCase):
         mock_walk,
     ):
         mock_walk.side_effect = [
+            [],
             [
                 ("C:\\cache\\151.0.7922.138", [], ["chromedriver.exe"]),
                 ("C:\\cache\\150.0.7871.124", [], ["chromedriver.exe"]),
@@ -1090,11 +1102,11 @@ class ConfigDrivenFilterTests(unittest.TestCase):
             def get_attribute(self, name):
                 return ""
 
-        top = Elem("Mahir Julka Resume.pdf", 100)
-        lower = Elem("Mahir Julka Resume.pdf", 900)
+        top = Elem("Example Applicant Resume.pdf", 100)
+        lower = Elem("Example Applicant Resume.pdf", 900)
 
         class Driver:
-            page_source = "Mahir Julka Resume.pdf"
+            page_source = "Example Applicant Resume.pdf"
 
             def __init__(self):
                 self.scrolled = []
@@ -1108,7 +1120,7 @@ class ConfigDrivenFilterTests(unittest.TestCase):
 
         driver = Driver()
         with mock.patch("SeekBot.time.sleep"):
-            selected = select_resume_if_present(driver, "Mahir Julka Resume.pdf")
+            selected = select_resume_if_present(driver, "Example Applicant Resume.pdf")
         self.assertTrue(selected)
         self.assertTrue(top.clicked)
         self.assertFalse(lower.clicked)
@@ -1351,7 +1363,7 @@ class ConfigDrivenFilterTests(unittest.TestCase):
     @mock.patch("SeekBot.wait_for_job_detail_ready", return_value={"ready": True, "identity": {"url": "https://www.seek.com.au/job/12345", "job_key": "https://www.seek.com.au/job/12345", "title": "Project Engineer"}})
     @mock.patch("SeekBot.QUICK_APPLY_ONLY", True)
     @mock.patch("SeekBot.DIRECT_APPLY_URL_FALLBACK", False)
-    def test_click_apply_with_job_detail_apply_attribute(self, _mock_ready):
+    def test_click_apply_rejects_plain_apply_even_with_job_detail_attribute(self, _mock_ready):
         class MockBtn:
             def __init__(self):
                 self.text = "Apply"
@@ -1393,10 +1405,36 @@ class ConfigDrivenFilterTests(unittest.TestCase):
                     btn.click()
 
         drv = MockDriver()
-        with mock.patch("SeekBot.detect_and_lock_seek_apply_page", return_value=True):
+        with mock.patch("SeekBot.detect_and_lock_seek_apply_page", return_value=True), mock.patch("SeekBot.append_quick_apply_debug", return_value="test-debug.log"):
             res = click_apply(drv, "https://www.seek.com.au/job/12345")
-            self.assertEqual(res, "opened")
-            self.assertTrue(btn.clicked)
+            self.assertEqual(res, "not_quick_apply")
+            self.assertFalse(btn.clicked)
+
+    @mock.patch("SeekBot.append_quick_apply_debug", return_value="test-debug.log")
+    @mock.patch("SeekBot.time.sleep")
+    @mock.patch("SeekBot.wait_for_job_detail_ready", return_value={"ready": True, "identity": {"url": "https://au.seek.com/job/12345", "title": "Project Engineer"}})
+    def test_external_and_non_quick_controls_are_never_clicked(self, _ready, _sleep, _debug):
+        for label, href in [
+            ("Apply", "https://employer.example/apply"),
+            ("Quick apply", "https://employer.example/apply"),
+            ("Apply", "https://au.seek.com/job/12345/apply"),
+            ("Apply with SEEK", "https://au.seek.com/job/12345/apply"),
+            ("Quick apply on company site", "https://au.seek.com/job/12345/apply"),
+        ]:
+            with self.subTest(label=label, href=href):
+                button = self._FakeQuickApplyElement(text=label, href=href, data_automation="job-detail-apply")
+                browser = self._FakeQuickApplyDriver([button])
+                with mock.patch("SeekBot.close_external_target_and_return") as close_external:
+                    self.assertIn(click_apply(browser, browser.current_url), ("not_found", "not_quick_apply"))
+                    self.assertFalse(button.clicked)
+                    close_external.assert_not_called()
+
+    def test_changed_external_target_is_blocked_immediately_before_click(self):
+        button = self._FakeQuickApplyElement(text="Quick apply", href="https://employer.example/apply")
+        browser = self._FakeQuickApplyDriver([button])
+        with mock.patch("SeekBot.detect_quick_apply", return_value={"available": True, "element": button}):
+            self.assertEqual(click_apply(browser, browser.current_url), "not_quick_apply")
+            self.assertFalse(button.clicked)
 
     @mock.patch("SeekBot.wait_for_job_detail_ready", return_value={"ready": True, "identity": {"url": "https://www.seek.com.au/job/12345", "job_key": "https://www.seek.com.au/job/12345", "title": "Project Engineer"}})
     @mock.patch("SeekBot.QUICK_APPLY_ONLY", True)
@@ -1532,6 +1570,11 @@ class ConfigDrivenFilterTests(unittest.TestCase):
 
 
 class StrictTitleMatcherTests(unittest.TestCase):
+    def setUp(self):
+        for patcher in [mock.patch.dict("SeekBot.MATCHING_CFG", {"exact_position_match": False}), mock.patch("SeekBot.ALLOW_RELATED_ROLES", True)]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_construction_labourer_title_cases(self):
         accepted_titles = [
             "Construction Labourer",

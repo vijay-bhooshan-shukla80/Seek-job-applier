@@ -14,6 +14,7 @@ from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.selenium_manager import SeleniumManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
@@ -21,7 +22,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from selenium.common.exceptions import InvalidSessionIdException, SessionNotCreatedException, TimeoutException, WebDriverException
 
-from config import CONFIG
+from config import CONFIG, BLOCKED_HR_IDENTIFIERS
 
 SEARCH_CFG = CONFIG.get("search", {})
 RESUME_CFG = CONFIG.get("resume", {})
@@ -130,12 +131,8 @@ TODAY_SUBMITTED_JOB_KEYS = set()
 ACTIVE_APPLY_STATE = {"job_key": "", "job_url": "", "apply_url": "", "locked": False}
 ACTIVE_JOB_CONTEXT = {"company_name": "", "position": ""}
 LAST_JOB_DECISION = {}
+VALIDATED_JOB_CONTEXT = {}
 
-BLOCKED_HR_IDENTIFIERS = [
-    "agastya",
-    "agastyakapoor",
-    "agastyakapoorgk",
-]
 FREE_EMAIL_DOMAINS = {
     "gmail.com",
     "yahoo.com",
@@ -242,6 +239,7 @@ def extract_browser_version(debug_data=None):
 
 def find_local_chromedriver(preferred_version=""):
     roots = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "selenium", "chromedriver", "win64"),
         os.path.join(os.path.expanduser("~"), ".cache", "selenium", "chromedriver", "win64"),
         os.path.join(os.path.expanduser("~"), ".wdm", "drivers", "chromedriver", "win64"),
     ]
@@ -266,9 +264,35 @@ def find_local_chromedriver(preferred_version=""):
         if same_major:
             same_major.sort(key=lambda item: item[0], reverse=True)
             return same_major[0][1]
+        # A cached driver for another major version cannot attach to this browser.
+        return ""
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1]
+
+
+def resolve_chromedriver(browser_version="", browser_binary=""):
+    if browser_version:
+        cached = find_local_chromedriver(browser_version)
+        if cached:
+            return cached
+    args = ["--browser", "chrome", "--cache-path",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "selenium"),
+            "--timeout", "30", "--avoid-stats"]
+    if browser_version:
+        args.extend(["--browser-version", browser_version])
+    if browser_binary:
+        args.extend(["--browser-path", browser_binary])
+    paths = SeleniumManager().binary_paths(args)
+    driver_path = paths.get("driver_path", "")
+    if not driver_path or not os.path.isfile(driver_path):
+        raise RuntimeError("Compatible ChromeDriver unavailable; check the network connection and retry.")
+    if browser_version:
+        version_output = subprocess.run([driver_path, "--version"], capture_output=True, text=True, timeout=10, check=True).stdout
+        driver_version = re.search(r"\d+(?:\.\d+)+", version_output)
+        if not driver_version or parse_version_tuple(driver_version.group())[0] != parse_version_tuple(browser_version)[0]:
+            raise RuntimeError(f"ChromeDriver is incompatible with Chrome {browser_version}; update the driver and retry.")
+    return driver_path
 
 
 def start_debug_chrome(first_url):
@@ -358,10 +382,10 @@ def build_debug_driver():
     chrome_options = Options()
     chrome_options.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}"
     debug_data = get_debug_info(timeout=2)
-    chromedriver_path = find_local_chromedriver(extract_browser_version(debug_data))
-    if chromedriver_path and os.path.exists(chromedriver_path):
-        return configure_driver_runtime(webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=chrome_options))
-    return configure_driver_runtime(webdriver.Chrome(options=chrome_options))
+    browser_version = extract_browser_version(debug_data)
+    chrome_options.browser_version = browser_version
+    chromedriver_path = resolve_chromedriver(browser_version, find_chrome_binary())
+    return configure_driver_runtime(webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=chrome_options))
 
 
 def build_standard_driver(start_url=""):
@@ -382,7 +406,7 @@ def build_standard_driver(start_url=""):
     chrome_options.add_argument("--test-type")
     chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--start-maximized")
-    chromedriver_path = find_local_chromedriver()
+    chromedriver_path = resolve_chromedriver(browser_binary=chrome_binary)
     try:
         if chromedriver_path and os.path.exists(chromedriver_path):
             driver = configure_driver_runtime(webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=chrome_options))
@@ -476,6 +500,7 @@ def verify_driver_session(driver):
 
 
 def clear_active_apply_state():
+    VALIDATED_JOB_CONTEXT.clear()
     ACTIVE_APPLY_STATE.update({"job_key": "", "job_url": "", "apply_url": "", "locked": False})
     ACTIVE_JOB_CONTEXT.update({"company_name": "", "position": ""})
 
@@ -490,6 +515,9 @@ def build_cover_letter_text(template_text, company_name="", position=""):
     company = (company_name or "").strip()
     role = (position or "").strip()
 
+    if "{position}" in text or "{company}" in text:
+        return text.replace("{position}", role).replace("{company}", company)
+
     if role and company:
         text = re.sub(r"\bposition\s+at\s+Company\b", f"{role} at {company}", text, flags=re.IGNORECASE)
         text = re.sub(r"\bthe\s+position\s+at\s+Company\b", f"the {role} at {company}", text, flags=re.IGNORECASE)
@@ -501,6 +529,8 @@ def build_cover_letter_text(template_text, company_name="", position=""):
 
 
 def rewrite_cover_letter_for_current_job(existing_text, company_name="", position=""):
+    if "{position}" in str(existing_text or "") or "{company}" in str(existing_text or ""):
+        return build_cover_letter_text(existing_text, company_name, position)
     text = build_cover_letter_text(existing_text, company_name, position).strip()
     company = (company_name or "").strip()
     role = (position or "").strip()
@@ -702,7 +732,7 @@ def choose_best_target_role(role_text, desired_roles):
     return best_role
 
 
-def title_role_match_details(actual_title, role_title, allow_loose=False):
+def title_role_match_details(actual_title, role_title, allow_loose=False, exact_position=False):
     actual_tokens = tokenize_title_for_matching(actual_title, drop_levels=True, drop_stop_words=True)
     role_tokens = tokenize_title_for_matching(role_title, drop_levels=True, drop_stop_words=True)
     actual_set = set(actual_tokens)
@@ -712,8 +742,21 @@ def title_role_match_details(actual_title, role_title, allow_loose=False):
     normalized_role = normalize_title_text(role_title)
     exact_phrase = bool(normalized_actual and normalized_role and normalized_role in normalized_actual)
     strict_match = bool(role_set) and role_set.issubset(actual_set)
+    if exact_position:
+        # Keep role words (including "associate") and their order. Only known
+        # location/employment labels may surround an otherwise exact position.
+        phrase = re.search(r"(?<!\w)" + re.escape(normalized_role) + r"(?!\w)", normalized_actual) if normalized_role else None
+        metadata_words = {
+            "full", "part", "time", "casual", "permanent", "temporary", "contract",
+            "remote", "hybrid", "onsite", "office", "based", "in", "at",
+            "melbourne", "sydney", "brisbane", "perth", "adelaide", "canberra",
+            "darwin", "hobart", "vic", "victoria", "nsw", "qld", "wa", "sa",
+            "act", "nt", "tas", "australia", "australian",
+        }
+        remainder = (normalized_actual[:phrase.start()] + " " + normalized_actual[phrase.end():]).split() if phrase else []
+        strict_match = bool(phrase) and all(word in metadata_words or (word.isdigit() and len(word) == 4) for word in remainder)
     loose_match = False
-    if allow_loose and not strict_match and len(role_set) >= 2:
+    if allow_loose and not exact_position and not strict_match and len(role_set) >= 2:
         missing = role_set.difference(actual_set)
         loose_match = len(missing) <= 1 and len(overlap) / max(1, len(role_set)) >= 0.75
     return {
@@ -735,10 +778,12 @@ def evaluate_target_title(actual_title, required_keywords=None, related_roles=No
     configured_related_roles = collect_string_list(
         related_roles if related_roles is not None else filter_config.get("related_roles", JOB_FILTER_RELATED_ROLES)
     )
+    allow_related = bool(filter_config.get("allow_related_roles", ALLOW_RELATED_ROLES))
+    exact_position = bool(filter_config.get("exact_position_match", MATCHING_CFG.get("exact_position_match", True)))
     normalized_title = normalize_title_text(actual_title)
     actual_tokens = tokenize_title_for_matching(actual_title, drop_levels=True, drop_stop_words=True)
     result = {
-        "enabled": STRICT_TITLE_MATCH and bool(desired_roles or configured_related_roles),
+        "enabled": STRICT_TITLE_MATCH,
         "job_title": (actual_title or "").strip(),
         "normalized_job_title": normalized_title,
         "job_title_tokens": actual_tokens,
@@ -751,7 +796,8 @@ def evaluate_target_title(actual_title, required_keywords=None, related_roles=No
         "checked_roles": desired_roles + configured_related_roles,
         "desired_roles": desired_roles,
         "related_roles": configured_related_roles,
-        "allow_related_roles": ALLOW_RELATED_ROLES,
+        "allow_related_roles": allow_related,
+        "exact_position_match": exact_position,
         "allow_loose_title_match": ALLOW_LOOSE_TITLE_MATCH,
         "classification_is_search_only": CLASSIFICATION_IS_SEARCH_ONLY,
         "match_details": {},
@@ -760,7 +806,7 @@ def evaluate_target_title(actual_title, required_keywords=None, related_roles=No
         return result
 
     for role in desired_roles:
-        details = title_role_match_details(actual_title, role, allow_loose=ALLOW_LOOSE_TITLE_MATCH)
+        details = title_role_match_details(actual_title, role, allow_loose=ALLOW_LOOSE_TITLE_MATCH, exact_position=exact_position)
         if details["matched"]:
             result.update({
                 "target_role": role,
@@ -773,9 +819,9 @@ def evaluate_target_title(actual_title, required_keywords=None, related_roles=No
             })
             return result
 
-    if ALLOW_RELATED_ROLES:
+    if allow_related:
         for role in configured_related_roles:
-            details = title_role_match_details(actual_title, role, allow_loose=ALLOW_LOOSE_TITLE_MATCH)
+            details = title_role_match_details(actual_title, role, allow_loose=ALLOW_LOOSE_TITLE_MATCH, exact_position=exact_position)
             if details["matched"]:
                 result.update({
                     "target_role": choose_best_target_role(role, desired_roles),
@@ -972,6 +1018,28 @@ def find_lenient_hits(haystack, keywords):
     return hits
 
 
+def find_location_hits(text, locations):
+    """Require the configured city, rather than any shared state/country word."""
+    aliases = {"victoria": "vic", "new south wales": "nsw", "queensland": "qld",
+               "western australia": "wa", "south australia": "sa",
+               "tasmania": "tas", "northern territory": "nt",
+               "australian capital territory": "act"}
+    def canonical(value):
+        value = normalize_text(value)
+        for long_name, short_name in aliases.items():
+            value = re.sub(r"\b" + long_name + r"\b", short_name, value)
+        return value
+    actual = " " + canonical(text) + " "
+    hits = []
+    for location in locations:
+        words = canonical(location).split()
+        city = [w for w in words if w not in {"vic", "nsw", "qld", "wa", "sa", "tas", "nt", "act", "australia"} and not w.isdigit()]
+        required = " ".join(city or words)
+        if required and " " + required + " " in actual:
+            hits.append(location)
+    return hits
+
+
 def role_overlap_score(title_text, detail_text="", role_keywords=None):
     combined_tokens = set(normalize_role_tokens(f"{title_text} {detail_text}"))
     role_keywords = collect_string_list(role_keywords)
@@ -1120,18 +1188,19 @@ def evaluate_match(title_text, detail_text):
     }
 
 
-def evaluate_configured_job_filters(title_text, detail_text, required_keywords=None, exclude_keywords=None, filters=None):
+def evaluate_configured_job_filters(title_text, detail_text, required_keywords=None, exclude_keywords=None, filters=None, job_metadata=None):
     full_text = normalize_text(f"{title_text} {detail_text}")
     filter_config = filters if isinstance(filters, dict) else JOB_FILTERS_CFG
     if required_keywords is None:
-        required_keywords = JOB_FILTER_REQUIRED_KEYWORDS
+        required_keywords = collect_string_list(filter_config.get("keywords", JOB_FILTER_REQUIRED_KEYWORDS))
     else:
         required_keywords = collect_string_list(required_keywords)
 
     if exclude_keywords is None:
-        exclude_keywords = JOB_FILTER_EXCLUDE_KEYWORDS
+        exclude_keywords = collect_string_list(filter_config.get("exclude_keywords", JOB_FILTER_EXCLUDE_KEYWORDS))
     else:
         exclude_keywords = collect_string_list(exclude_keywords)
+    exclude_keywords = collect_string_list(exclude_keywords) + collect_string_list(EXCLUDE_KEYWORDS)
 
     title_match_result = evaluate_target_title(
         title_text,
@@ -1147,7 +1216,7 @@ def evaluate_configured_job_filters(title_text, detail_text, required_keywords=N
     missing_required = [] if title_match_result.get("title_match") else list(required_keywords)
     rejection_reasons = []
 
-    enabled = bool(required_keywords or exclude_keywords)
+    enabled = True
     has_required_match = True if not required_keywords else bool(required_hits)
     if STRICT_TITLE_MATCH and title_match_result.get("enabled"):
         has_required_match = bool(title_match_result.get("title_match"))
@@ -1163,20 +1232,20 @@ def evaluate_configured_job_filters(title_text, detail_text, required_keywords=N
         rejection_reasons.append("excluded keyword matched")
 
     configured_job_types = [normalize_text(item) for item in collect_string_list(filter_config.get("job_type", []))]
-    actual_job_types = infer_job_type_signals(full_text)
+    actual_job_types = infer_job_type_signals(normalize_text(job_metadata.get("job_type", "")) if job_metadata is not None else full_text)
     job_type_hits = [item for item in configured_job_types if item in actual_job_types]
     strict_job_type = bool(filter_config.get("strict_job_type", False))
-    if configured_job_types and actual_job_types and not job_type_hits and strict_job_type:
+    if configured_job_types and not job_type_hits and strict_job_type:
         rejection_reasons.append("job type not matched")
 
     configured_locations = collect_string_list(filter_config.get("location", []))
-    location_hits = find_lenient_hits(full_text, configured_locations)
+    location_hits = find_location_hits(job_metadata.get("location", "") if job_metadata is not None else full_text, configured_locations)
     if configured_locations and not location_hits:
         rejection_reasons.append("location not matched")
 
-    salary_numbers = extract_salary_numbers(f"{title_text} {detail_text}")
+    salary_numbers = extract_salary_numbers(job_metadata.get("salary", "") if job_metadata is not None else f"{title_text} {detail_text}")
     configured_experience = get_first_numeric_value(filter_config.get("experience", []))
-    if configured_experience:
+    if configured_experience is not None:
         experience_info = extract_experience_requirements(title_text, detail_text)
         if experience_info.get("mentioned") and experience_info.get("minimum") is not None:
             required_experience = int(experience_info["minimum"])
@@ -1673,6 +1742,32 @@ def extract_job_key_from_href(href):
     return href
 
 
+def direct_job_entry_from_url(url):
+    """Return one exact job entry when config contains a SEEK job URL."""
+    raw_url = (url or "").strip()
+    if not raw_url or not is_seek_domain(raw_url):
+        return None
+
+    parsed = urlparse(raw_url)
+    path = (parsed.path or "").rstrip("/")
+    match = re.match(r"^(/job/[^/]+)(?:/apply)?$", path, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    detail_path = match.group(1)
+    detail_url = f"{parsed.scheme}://{parsed.netloc}{detail_path}"
+    job_key = extract_job_key_from_href(detail_url)
+    if not job_key:
+        return None
+    return {
+        "key": job_key,
+        "url": detail_url,
+        "title": "Target Job URL",
+        "list_applied": False,
+        "list_quick_apply": False,
+        "direct_target": True,
+    }
+
 def get_job_entries(driver):
     selectors = [
         "//a[@data-automation='jobTitle' and contains(@href, '/job/')]",
@@ -1826,6 +1921,8 @@ def is_application_submitted(driver):
         "//*[@data-automation='application-confirmation']",
         "//*[@data-testid='application-confirmation']",
         "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'application sent')]",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'your application has been sent')]",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'your application was sent')]",
         "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'application submitted')]",
         "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'successfully applied')]",
         "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), \"you've applied\")]",
@@ -2610,6 +2707,15 @@ def append_quick_apply_debug(job_url, expected_title, detection_result):
     return debug_path
 
 
+def is_allowed_apply_control(href, text, job_url):
+    text = normalize_text(text)
+    if any(marker in text for marker in ("external", "company site", "advertiser s site", "employer site")):
+        return False
+    if href and classify_apply_target(urljoin(job_url, href), text) != "seek_in_site":
+        return False
+    return not QUICK_APPLY_ONLY or bool(re.search(r"\bquick apply\b", text))
+
+
 def detect_quick_apply(driver, job_context=None, timeout=4):
     job_context = job_context or {}
     expected_job_url = job_context.get("job_url", "")
@@ -2650,8 +2756,6 @@ def detect_quick_apply(driver, job_context=None, timeout=4):
             href = item["href"]
             visible_ctas.append(text_blob or href or item["data_automation"] or item["data_testid"])
             is_quick_text = "quick apply" in text_blob or "apply with seek" in text_blob
-            if is_quick_text:
-                has_quick_text = True
             is_stable_seek = item["data_automation"] == "job-detail-apply" or item["data_testid"] == "job-detail-apply"
             is_seek_apply_href = bool(href and classify_apply_target(href, text_blob) == "seek_in_site")
             is_apply_semantic = (
@@ -2661,6 +2765,10 @@ def detect_quick_apply(driver, job_context=None, timeout=4):
             )
             if is_apply_semantic and not is_quick_text:
                 found_apply_but_not_quick = True
+            if not is_allowed_apply_control(href, text_blob, expected_job_url or final_identity.get("url", "")):
+                continue
+            if is_quick_text:
+                has_quick_text = True
 
             score = 0
             method = ""
@@ -2673,7 +2781,7 @@ def detect_quick_apply(driver, job_context=None, timeout=4):
             ):
                 score = 90
                 method = "aria_attribute"
-            elif is_stable_seek and (is_seek_apply_href or is_apply_semantic):
+            elif not QUICK_APPLY_ONLY and is_stable_seek and (is_seek_apply_href or is_apply_semantic):
                 score = 85
                 method = "stable_seek_attribute"
             elif not QUICK_APPLY_ONLY and is_seek_apply_href:
@@ -2757,6 +2865,10 @@ def click_apply(driver, job_url, is_quick_apply=False, expected_title=""):
             if btn is None:
                 break
         try:
+            # Recheck the live control immediately before clicking: an Apply
+            # attribute alone never proves that a control is Quick Apply.
+            if not is_allowed_apply_control((btn.get_attribute("href") or "").strip(), get_element_text_blob(btn), job_url):
+                return "not_quick_apply"
             origin_handles = driver.window_handles
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
             try:
@@ -2941,12 +3053,15 @@ def get_job_text_snapshot(driver):
                 continue
 
     title = ""
-    for xp in ["//h1", "//*[@data-automation='job-detail-title']"]:
+    for xp in ["//*[@data-automation='job-detail-title']", "//*[@data-testid='job-title']", "//h1"]:
         elems = driver.find_elements(By.XPATH, xp)
-        if elems:
-            title = (elems[0].text or "").strip()
-            if title:
-                break
+        for elem in elems:
+            if elem.is_displayed():
+                title = (elem.text or "").strip()
+                if title:
+                    break
+        if title:
+            break
 
     blocks = []
     for xp in [
@@ -2965,7 +3080,31 @@ def get_job_text_snapshot(driver):
     return title, "\n".join(blocks).strip()
 
 
-def select_resume_if_present(driver, target_name="Agastya Resume.pdf"):
+def get_job_filter_metadata(driver):
+    """Read advertised fields, excluding recommendations and company prose."""
+    fields = {"location": "job-detail-location", "job_type": "job-detail-work-type",
+              "salary": "job-detail-salary"}
+    result = {}
+    for field, automation in fields.items():
+        result[field] = ""
+        for selector in [f"//*[@data-automation='{automation}']", f"//*[@data-testid='{automation}']"]:
+            for element in driver.find_elements(By.XPATH, selector):
+                if element.is_displayed() and (element.text or "").strip():
+                    result[field] = element.text.strip()
+                    break
+            if result[field]:
+                break
+    return result
+
+
+def get_seek_job_id(url):
+    if not is_seek_domain(url):
+        return ""
+    match = re.search(r"/job/(\d+)(?:/|$)", urlparse(url).path)
+    return match.group(1) if match else ""
+
+
+def select_resume_if_present(driver, target_name=""):
     normalized_target = normalize_text(target_name)
     page_text = normalize_text(driver.page_source)
     if normalized_target and normalized_target in page_text:
@@ -3025,8 +3164,14 @@ def select_resume_if_present(driver, target_name="Agastya Resume.pdf"):
 def get_field_context_text(driver, elem):
     try:
         text = driver.execute_script(
-            """
+            r"""
             const el = arguments[0];
+            const labels = Array.from(el.labels || []).map(label => label.innerText);
+            const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\s+/)
+              .map(id => document.getElementById(id)?.innerText || '');
+            const explicit = [...labels, ...labelledBy, el.getAttribute('aria-label'),
+              el.getAttribute('placeholder')].filter(Boolean).join(' ');
+            if (explicit.trim()) return explicit;
             const container = el.closest('fieldset, section, form, div');
             return (container ? container.innerText : (el.innerText || el.textContent || '')) || '';
             """,
@@ -3044,14 +3189,23 @@ def set_input_value(driver, elem, value):
     except Exception:
         pass
 
+    # Keyboard events update controlled React fields as well as the DOM value.
+    try:
+        elem.clear()
+        elem.send_keys(fill_value)
+        driver.execute_script("arguments[0].blur();", elem)
+        if (elem.get_attribute("value") or elem.text or "").strip() == fill_value.strip():
+            return True
+    except Exception as exc:
+        raise_session_reconnect(exc, "set_input_value_keyboard")
+
     script = """
     const el = arguments[0];
     const value = arguments[1];
     el.focus();
-    el.value = '';
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.value = value;
+    const prototype = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+    if (setter) setter.call(el, value); else el.value = value;
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new Event('blur', { bubbles: true }));
@@ -3106,12 +3260,15 @@ def is_cover_letter_context(context):
 
 def get_configured_answer_for_context(context, answers=None):
     context_text = normalize_text(context)
+    for question, answer in APPLY_CFG.get("employer_answers", {}).items():
+        if normalize_text(question) and normalize_text(question) in context_text and str(answer).strip():
+            return "employer_answer", [str(answer).strip()]
     configured_answers = dict(JOB_FILTERS_CFG)
     if isinstance(answers, dict):
         configured_answers.update(answers)
 
     mapping = [
-        ("expected_salary", ["expected salary", "salary expectation", "salary are you expecting"]),
+        ("expected_salary", ["expected salary", "expected annual base salary", "salary expectation", "salary are you expecting"]),
         ("current_salary", ["current salary", "what are you currently earning", "what is your salary"]),
         ("visa_type", ["visa", "work rights", "right to work", "work in australia"]),
         ("experience", ["years experience", "how many years", "experience do you have"]),
@@ -3142,6 +3299,20 @@ def get_configured_answer_for_context(context, answers=None):
     return "", []
 
 
+def get_choice_answer_tokens(field_name, answer_tokens):
+    tokens = list(answer_tokens)
+    if field_name in ("expected_salary", "current_salary"):
+        for answer in answer_tokens:
+            amount = get_first_numeric_value([answer])
+            if amount and amount >= 1000:
+                tokens.extend([f"{amount / 1000:g}k", f"${amount / 1000:g}k"])
+    if field_name == "visa_type":
+        visa = normalize_text(" ".join(answer_tokens))
+        if "485" in visa or "graduate" in visa:
+            tokens.append("I have a graduate temporary work visa")
+    return tokens
+
+
 def select_first_matching_option(select_elem, match_tokens):
     try:
         sel = Select(select_elem)
@@ -3160,8 +3331,8 @@ def select_first_matching_option(select_elem, match_tokens):
         digit_value = re.sub(r"[^\d]", "", option.get_attribute("value") or "")
         if not text or text in ("select", "select one", "please select"):
             continue
-        text_match = any(token in text or token in value for token in normalized_tokens)
-        digit_match = any(token in digit_text or token in digit_value for token in digit_tokens)
+        text_match = any(token == text or token == value for token in normalized_tokens)
+        digit_match = any(token == digit_text or token == digit_value for token in digit_tokens)
         if text_match or digit_match:
             try:
                 sel.select_by_visible_text(option.text)
@@ -3186,36 +3357,18 @@ def answer_common_select_questions(driver):
         try:
             if not select_elem.is_displayed() or not select_elem.is_enabled():
                 continue
-            current_value = normalize_text(select_elem.get_attribute("value") or "")
-            selected_text = ""
-            try:
-                selected_text = normalize_text(Select(select_elem).first_selected_option.text)
-            except Exception:
-                selected_text = ""
-            if current_value and selected_text not in ("", "select", "select one", "please select"):
-                continue
-
             context = get_field_context_text(driver, select_elem)
             if not context:
                 continue
 
             field_name, answer_tokens = get_configured_answer_for_context(context)
+            answer_tokens = get_choice_answer_tokens(field_name, answer_tokens)
             if answer_tokens and select_first_matching_option(select_elem, answer_tokens):
+                driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles:true})); arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", select_elem)
                 print(f"EMPLOYER_Q:{field_name}={answer_tokens[0]}")
                 changed = True
                 continue
 
-            if any(token in context for token in ["right to work", "work rights", "work in australia", "visa"]):
-                if select_first_matching_option(select_elem, ["temporary visa", "student visa", "restrictions on work hours"]):
-                    print("EMPLOYER_Q:work_rights=temp_visa")
-                    changed = True
-                    continue
-
-            if any(token in context for token in ["years experience", "how many years", "experience do you have"]):
-                if select_first_matching_option(select_elem, ["0", "0-1", "less than 1", "under 1", "1 year", "1-2"]):
-                    print("EMPLOYER_Q:experience=conservative")
-                    changed = True
-                    continue
         except Exception as exc:
             if is_session_recoverable_error(exc):
                 raise SessionReconnectRequired("answer_common_select_questions_state") from exc
@@ -3243,10 +3396,12 @@ def answer_common_input_questions(driver):
                 company_name = ACTIVE_JOB_CONTEXT.get("company_name", "")
                 position = ACTIVE_JOB_CONTEXT.get("position", "")
                 source_text = "\n".join(answer_tokens).strip() if answer_tokens else current_value
-                fill_value = rewrite_cover_letter_for_current_job(source_text, company_name, position)
+                # Configured templates are already rendered for this job. Do
+                # not rewrite their introduction or any applicant information.
+                fill_value = source_text if answer_tokens else rewrite_cover_letter_for_current_job(source_text, company_name, position)
                 if not fill_value:
                     continue
-                if normalize_text(current_value) == normalize_text(fill_value):
+                if current_value == fill_value:
                     continue
                 field_name = "cover_letter"
             else:
@@ -3301,6 +3456,7 @@ def answer_common_radio_questions(driver):
         try:
             context = get_field_context_text(driver, container)
             field_name, answer_tokens = get_configured_answer_for_context(context)
+            answer_tokens = get_choice_answer_tokens(field_name, answer_tokens)
             if not answer_tokens:
                 continue
 
@@ -3358,43 +3514,14 @@ def click_visible_label_choice(driver, label_text):
 
 
 def answer_known_employer_questions(driver):
-    text = normalize_text(driver.page_source)
     changed = False
 
     changed = answer_common_select_questions(driver) or changed
     changed = answer_common_input_questions(driver) or changed
     changed = answer_common_radio_questions(driver) or changed
 
-    if "rsa" in text or "responsible service of alcohol" in text:
-        if click_visible_label_choice(driver, "no"):
-            print("EMPLOYER_Q:rsa=no")
-            changed = True
-
-    yes_selectors = [
-        "//label[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'yes')]",
-        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'yes')]",
-    ]
-    keywords = ["driver", "driver's licence", "right to work", "work rights", "australia"]
-    matched = any(k in text for k in keywords)
-    if not matched:
-        return changed
-
-    for xp in yes_selectors:
-        elems = driver.find_elements(By.XPATH, xp)
-        for elem in elems:
-            try:
-                if not elem.is_displayed() or not elem.is_enabled():
-                    continue
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
-                try:
-                    elem.click()
-                except Exception:
-                    driver.execute_script("arguments[0].click();", elem)
-                print("EMPLOYER_Q:yes")
-                time.sleep(0.2)
-                return True
-            except Exception:
-                continue
+    # Do not infer licence/certificate/work-rights answers from unrelated page
+    # words. Only configured, question-specific answers may be selected.
     return changed
 
 
@@ -4072,7 +4199,17 @@ def append_apply_log(
     return True
 
 
+def get_active_application_step(driver):
+    for element in driver.find_elements(By.XPATH, "//*[@aria-current='step']"):
+        if element.is_displayed():
+            return normalize_text(element.text)
+    return ""
+
+
 def is_employer_questions_step(driver):
+    active_step = get_active_application_step(driver)
+    if active_step:
+        return "employer questions" in active_step or "role requirements" in active_step
     current = (driver.current_url or "").lower()
     if "role-requirements" in current or "employer-questions" in current:
         return True
@@ -4269,6 +4406,9 @@ def get_primary_action_selectors(step_name):
 
 
 def is_seek_profile_update_step(driver):
+    active_step = get_active_application_step(driver)
+    if active_step:
+        return "update" in active_step and "profile" in active_step
     checks = [
         "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'update seek profile')]",
         "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'your seek profile is part of your application')]",
@@ -4294,6 +4434,9 @@ def should_prepare_active_application(driver, phase=None, step_name=""):
         phase = get_current_flow_phase(driver)
     if phase == "review_submit":
         return False
+    active_step = get_active_application_step(driver)
+    if any(label in active_step for label in ("documents", "employer questions", "role requirements")):
+        return True
     if step_name in ("CONTINUE", "NEXT", "REVIEW") and not has_unanswered_required_questions(driver):
         return False
     if is_seek_profile_update_step(driver):
@@ -4331,7 +4474,17 @@ def wait_for_step_progress(driver, before_url, before_phase, before_action, befo
 
 def revalidate_current_job_title_before_submit(driver):
     identity = get_current_job_identity(driver)
-    title_result = evaluate_target_title(identity.get("title", ""))
+    validated = VALIDATED_JOB_CONTEXT
+    current_title = identity.get("title", "")
+    generic_heading = normalize_text(current_title) in {"", "review", "review and submit", "review your application", "submit application", "your application"}
+    title_result = evaluate_target_title(validated.get("title", "") if generic_heading else current_title)
+    identity_ok = bool(validated.get("job_id")) and get_seek_job_id(identity.get("url", "")) == validated.get("job_id")
+    title_ok = generic_heading or normalize_title_text(current_title) == normalize_title_text(validated.get("title", ""))
+    filters_ok = False
+    if validated:
+        filters_ok = evaluate_configured_job_filters(validated["title"], validated["detail"], job_metadata=validated["metadata"])["eligible"]
+    if not identity_ok or not title_ok or not filters_ok:
+        title_result.update(title_match=False, decision="SKIP", reason="SKIP_UNVERIFIED_JOB_OR_FILTERS")
     log_title_match_result(title_result)
     return title_result
 
@@ -4400,7 +4553,7 @@ def run_quick_apply_flow(driver, job_key="", artifact_state=None):
                 elif step_name in ("SUBMIT_APPLICATION", "SUBMIT"):
                     print(f"FLOW_ADVANCE:primary_cta={step_name}")
                 clicked = False
-                if REVALIDATE_TITLE_BEFORE_SUBMIT and phase == "review_submit" and step_name in ("SUBMIT_APPLICATION", "SUBMIT"):
+                if step_name in ("SUBMIT_APPLICATION", "SUBMIT"):
                     final_title_check = revalidate_current_job_title_before_submit(driver)
                     if not final_title_check.get("title_match"):
                         return "title_mismatch_final_check"
@@ -4537,9 +4690,10 @@ def process_job_url(driver, job_entry, idx, stats):
                 return job_key, driver
 
             title_text, detail_text = get_job_text_snapshot(driver)
+            job_metadata = get_job_filter_metadata(driver)
             LAST_HR_TEXT = build_hr_context_text(driver, title_text, detail_text)
             LAST_HR_LINK = extract_hr_profile_link(driver)
-            filter_result = evaluate_configured_job_filters(title_text, detail_text)
+            filter_result = evaluate_configured_job_filters(title_text, detail_text, job_metadata=job_metadata)
             log_title_match_result(filter_result.get("title_match_result") or {})
             log_filter_result(job_key, title_text, filter_result)
 
@@ -4616,6 +4770,8 @@ def process_job_url(driver, job_entry, idx, stats):
             elif not MATCHING_ENABLED and SHOW_MATCH_DETAILS:
                 print("MATCH_BYPASS:matching.enabled=False")
 
+            VALIDATED_JOB_CONTEXT.clear()
+            VALIDATED_JOB_CONTEXT.update(job_id=get_seek_job_id(job_url), title=title_text, detail=detail_text, metadata=job_metadata)
             artifact_state = {"before_screenshot": capture_job_start_screenshot(driver, job_key)}
 
             apply_state = click_apply(driver, job_url, is_quick_apply=job_entry.get("list_quick_apply", False), expected_title=position)
@@ -4857,6 +5013,39 @@ def run_continuous(driver):
         dedup_skipped_this_search = 0
 
         print(f"SEARCH_START:{search_url}")
+        # A configured /job/<id> (or /job/<id>/apply) URL is an exact target,
+        # not a search page. Never enumerate related/search-result jobs for it.
+        direct_entry = direct_job_entry_from_url(search_url)
+        if direct_entry:
+            key = direct_entry["key"]
+            if key in processed_global:
+                dedup_skipped_this_search += 1
+                print(f"SKIP_DUPLICATE:{key}")
+            elif should_skip_previously_submitted_job(key):
+                print(f"SKIP_APPLIED_TODAY:{key}")
+                stats["scanned"] += 1
+                stats["skipped_applied"] += 1
+                scanned_this_search += 1
+                processed_global.add(key)
+            else:
+                stats["scanned"] += 1
+                scanned_this_search += 1
+                result_key, driver = process_job_url(driver, direct_entry, 1, stats)
+                processed_global.add(result_key or key)
+
+            per_url_end = dict(stats)
+            print(
+                "SEARCH_DONE:"
+                f"url={search_url} "
+                f"scanned={per_url_end['scanned'] - per_url_start['scanned']} "
+                f"applied={per_url_end['applied'] - per_url_start['applied']} "
+                f"skip_filtered={per_url_end['skipped_filtered'] - per_url_start['skipped_filtered']} "
+                f"skip_applied={per_url_end['skipped_applied'] - per_url_start['skipped_applied']} "
+                f"skip_no_quick_apply={per_url_end['skipped_no_quick_apply'] - per_url_start['skipped_no_quick_apply']} "
+                f"failed={per_url_end['failed'] - per_url_start['failed']} "
+                f"dedup_skipped={dedup_skipped_this_search}"
+            )
+            continue
         open_jobs_page(driver, search_url)
         pages_in_this_search = 0
         empty_page_retries = 0

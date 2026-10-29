@@ -1,0 +1,15 @@
+{
+  "SEARCH_URLS": ["https://www.seek.com.au/customer-service-jobs"],
+  "DESIRED_POSITIONS": ["Customer Service Officer"],
+  "RELATED_POSITIONS": [],
+  "LOCATION": "",
+  "EXPERIENCE_YEARS": null,
+  "MINIMUM_SALARY": null,
+  "EXPECTED_SALARY": null,
+  "VISA_TYPE": "",
+  "RESUME_FILE_NAME": "",
+  "COVER_LETTER_FILE_NAME": "",
+  "COVER_LETTER_TEMPLATE": "",
+  "EMPLOYER_ANSWERS": {},
+  "BLOCKED_HR_IDENTIFIERS": []
+}
